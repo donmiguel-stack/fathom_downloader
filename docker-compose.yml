@@ -1,0 +1,31 @@
+services:
+  fathom-downloader:
+    build: .
+    container_name: fathom-downloader
+    restart: unless-stopped
+
+    # Read FATHOM_API_KEY from a .env file next to this one.
+    # Copy .env.example to .env and paste your key in.
+    env_file:
+      - .env
+
+    # Where the videos land. The left side of the colon is the path on
+    # YOUR machine -- change it to wherever you have space.
+    #
+    #   ./videos:/data                       -> a folder next to this file
+    #   /mnt/data/fathom-videos:/data        -> an external drive (Umbrel)
+    #
+    # A two-year library can easily run past 100 GB, so check free space
+    # first with:  df -h /path/you/picked
+    volumes:
+      - ./videos:/data
+
+    # Small home servers (Umbrel, Raspberry Pi, NAS) are often already
+    # running memory-hungry things. This caps the downloader so it can
+    # never be the reason something more important gets OOM-killed.
+    # Raise or delete these on a machine with RAM to spare.
+    mem_limit: 400m
+    memswap_limit: 400m
+
+    # Swap --years for --since YYYY-MM-DD if you want an exact start date.
+    command: ["--output-dir", "/data", "--years", "2"]

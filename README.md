@@ -1,0 +1,285 @@
+# Fathom Video Downloader
+
+Bulk-download every video recording from a [Fathom](https://fathom.video)
+account using Fathom's official public API.
+
+Fathom has no "export everything" button. If you want your recordings on
+your own disk — leaving the platform, keeping an archive, handing a client
+their sessions — the only way to do it is one recording at a time through
+the UI, or through the API. This script does the API route, unattended, and
+resumes cleanly if it's interrupted.
+
+Two ways to run it:
+
+- **[On your computer](#option-a-run-it-on-your-computer)** — simplest. One
+  Python script. Good for a few dozen recordings, or when you just want the
+  files and you're happy to leave a terminal open.
+- **[On a home server via Docker](#option-b-run-it-on-a-server-umbrel-nas-raspberry-pi)** —
+  for large libraries. Runs 24/7 in the background, survives reboots, doesn't
+  tie up your laptop. Tested on [Umbrel](https://umbrel.com), but it's plain
+  Docker Compose and will run anywhere.
+
+Both paths use the same `fathom_downloader.py`, so a fix to one is a fix to
+both.
+
+---
+
+## What you get
+
+Videos land in your chosen folder, named by date and meeting title:
+
+```
+2026-08-12 - Mentor Annemarie (172549586).mp4
+2026-07-14 - Impromptu Zoom Meeting (163581888).mp4
+2026-04-06 - Weekly Standup (135638912).mp4
+```
+
+Sizes vary a lot — a 30-minute call might be 130 MB, a two-hour screen share
+1.3 GB. **A two-year library can easily exceed 100 GB.** Check your free
+space before starting.
+
+---
+
+## First: get an API key
+
+1. Log in to Fathom.
+2. Go to **Settings → API Access**.
+3. Generate a key and copy it.
+
+The key grants read access to every recording in the account, so treat it
+like a password. Don't paste it into a file you might commit.
+
+> **Note on plans:** API access isn't available on every Fathom tier. If you
+> don't see the API Access section, that's why — check your plan or ask
+> Fathom support.
+
+---
+
+## Option A: Run it on your computer
+
+**Requirements:** Python 3.8+ and the `requests` library.
+
+```bash
+git clone https://github.com/YOUR-USERNAME/fathom-video-downloader.git
+cd fathom-video-downloader
+pip install requests
+```
+
+Set your key and run:
+
+```bash
+export FATHOM_API_KEY="paste-your-key-here"
+python3 fathom_downloader.py
+```
+
+On Windows (PowerShell):
+
+```powershell
+$env:FATHOM_API_KEY = "paste-your-key-here"
+python3 fathom_downloader.py
+```
+
+That downloads the last 2 years into a `fathom_videos/` folder. To check the
+scale of the job before committing to it:
+
+```bash
+python3 fathom_downloader.py --list-only
+```
+
+### Options
+
+| Flag | What it does |
+|---|---|
+| `--output-dir DIR` | Where to save videos (default: `./fathom_videos`) |
+| `--years N` | How many years back to go (default: `2`) |
+| `--since YYYY-MM-DD` | Exact start date, instead of `--years` |
+| `--list-only` | Count what would be downloaded, download nothing |
+| `--api-key KEY` | Pass the key directly instead of via environment |
+
+Examples:
+
+```bash
+# Everything since the start of 2024, onto an external drive
+python3 fathom_downloader.py --since 2024-01-01 --output-dir /Volumes/Archive/fathom
+
+# Just the last 6 months
+python3 fathom_downloader.py --years 0.5
+```
+
+### Leaving it running
+
+Large libraries take hours. The script is safe to interrupt — `Ctrl+C`, close
+the laptop, lose wifi — and re-running the same command picks up exactly
+where it left off. Anything already downloaded is skipped.
+
+If you'd rather it survive your terminal closing:
+
+```bash
+nohup python3 fathom_downloader.py > fathom.log 2>&1 &
+tail -f fathom.log
+```
+
+---
+
+## Option B: Run it on a server (Umbrel, NAS, Raspberry Pi)
+
+Better for big libraries: it runs in the background indefinitely, restarts
+itself if the machine reboots, and downloads straight to whatever storage
+your server has.
+
+**Requirements:** Docker and Docker Compose, plus SSH access.
+
+### 1. Get the files onto the server
+
+```bash
+git clone https://github.com/YOUR-USERNAME/fathom-video-downloader.git
+cd fathom-video-downloader
+```
+
+(No git on the server? Clone locally and `scp -r` the folder over.)
+
+### 2. Add your API key
+
+```bash
+cp .env.example .env
+nano .env        # paste your key, Ctrl+O to save, Ctrl+X to exit
+```
+
+### 3. Choose where videos land
+
+Edit the `volumes:` line in `docker-compose.yml`. The default writes to a
+`videos/` folder next to the compose file. To use an external drive:
+
+```yaml
+volumes:
+  - /mnt/data/fathom-videos:/data
+```
+
+Check you have room first:
+
+```bash
+df -h /mnt/data
+```
+
+### 4. Build and start
+
+```bash
+docker compose build
+docker compose up -d
+docker compose logs -f
+```
+
+`Ctrl+C` stops watching the logs. It does **not** stop the download — that
+keeps running in the background.
+
+### 5. Check on it later
+
+```bash
+ls /mnt/data/fathom-videos/*.mp4 | wc -l   # how many are done
+docker compose logs --tail 50               # recent activity
+docker compose ps                           # still running?
+docker compose stop                         # pause (resumes where it left off)
+docker compose start                        # resume
+docker compose down                         # stop and remove the container
+```
+
+### A note on memory
+
+`docker-compose.yml` caps the container at 400 MB. This is deliberate: home
+servers like Umbrel are often already running memory-hungry services, and on
+a 4 GB Raspberry Pi an unbounded process can trigger the OOM killer and take
+down something you care about a lot more than a video download. The cap costs
+nothing here — the script streams to disk in 1 MB chunks and never holds a
+video in memory. Raise or remove it on a machine with RAM to spare.
+
+---
+
+## How it works
+
+Fathom's download API is asynchronous and two-step:
+
+1. `POST /recordings/{id}/download` asks Fathom to prepare a video, and
+   returns a `download_id`.
+2. `GET /recordings/{id}/downloads/{download_id}` reports status, and once
+   it's `completed`, includes a signed, time-limited URL to the actual file.
+
+The script therefore runs in two phases. **Phase 1** asks Fathom to prepare
+every outstanding recording, up front. **Phase 2** sweeps the full list
+repeatedly, downloading whatever became ready since the last pass and backing
+off between sweeps.
+
+The up-front batching in phase 1 matters more than it looks. Requesting one
+video, waiting for it, then requesting the next serializes work Fathom is
+perfectly happy to do in parallel — the difference between hours and days on
+a large library.
+
+The sweep loop never exits while anything is outstanding. That's also
+deliberate: under `restart: unless-stopped`, a clean exit means an immediate
+restart from scratch, which produces an infinite loop that looks like healthy
+activity in the logs while never finishing anything.
+
+Rate limiting is built in — roughly 20 requests/minute against the recordings
+endpoints and 50/minute overall, comfortably under Fathom's documented caps.
+The video transfers themselves go to signed storage URLs that don't count
+against the API limit, so those run at full speed.
+
+Progress is tracked in `.fathom_download_state.json` inside your output
+folder. Delete it only if you want to start completely over.
+
+---
+
+## Troubleshooting
+
+**Nothing downloads; the log just repeats "still rendering."**
+Check what Fathom actually reports for one recording:
+
+```bash
+curl -s -H "X-Api-Key: $FATHOM_API_KEY" \
+  "https://api.fathom.ai/external/v1/recordings/RECORDING_ID/downloads/DOWNLOAD_ID" \
+  | python3 -m json.tool
+```
+
+If that shows `"status": "completed"`, the videos are ready and the problem
+is on the client side, not Fathom's.
+
+**`422 Unprocessable Entity` on a specific recording.**
+Fathom has no downloadable video for it — typically audio-only, or a capture
+that failed. The script marks it and skips it rather than retrying forever.
+Expect the occasional one in a large library.
+
+**`401 Unauthorized`.**
+Bad or expired key. Regenerate it in Settings → API Access.
+
+**Container exits with code 137.**
+That's an OOM kill. Something on the machine ran out of memory — see the
+memory note above, and check whether the host itself is under pressure with
+`free -h`.
+
+**`source .env` doesn't make the key visible to Python.**
+`source` sets a shell variable but doesn't export it to child processes. Use:
+
+```bash
+set -a; source .env; set +a
+```
+
+**Downloads start but fail partway with an expired-link error.**
+Signed URLs are time-limited. The script drops the stale link and re-requests
+a fresh one on the next sweep, so this is self-healing — just let it run.
+
+---
+
+## Contributing
+
+Issues and pull requests welcome. This was built against Fathom's API as it
+behaved in 2026; if their response shape changes, `extract_file_url()` in
+`fathom_downloader.py` is the first place to look — it deliberately accepts
+several spellings of the video URL field for exactly that reason.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Not affiliated with or endorsed by Fathom. It uses their documented public
+API. You're responsible for having the right to download the recordings you
+point it at, and for handling them appropriately once you do — meeting
+recordings usually contain other people's voices and words.

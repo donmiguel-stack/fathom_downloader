@@ -1,0 +1,22 @@
+# Your API key lives here. Never commit it.
+.env
+
+# Downloaded recordings and partial transfers.
+videos/
+fathom_videos/
+*.mp4
+*.mp4.part
+
+# Progress/resume state (contains signed download URLs).
+.fathom_download_state.json
+*.json.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS noise
+.DS_Store
+Thumbs.db
