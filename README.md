@@ -46,12 +46,59 @@ space before starting.
 2. Go to **Settings → API Access**.
 3. Generate a key and copy it.
 
-The key grants read access to every recording in the account, so treat it
-like a password. Don't paste it into a file you might commit.
-
 > **Note on plans:** API access isn't available on every Fathom tier. If you
 > don't see the API Access section, that's why — check your plan or ask
 > Fathom support.
+
+### Where to put it
+
+**No API key ships with this repo, and none should ever be committed to it.**
+The key is yours; you supply it at runtime. There are two places to put it,
+depending on how you're running things.
+
+**Running on your computer** — set it as an environment variable in the
+terminal you're about to run the script from:
+
+```bash
+export FATHOM_API_KEY="paste-your-key-here"        # macOS / Linux
+```
+```powershell
+$env:FATHOM_API_KEY = "paste-your-key-here"        # Windows PowerShell
+```
+
+This lasts only for that terminal session, which is a feature — nothing is
+written to disk. To make it permanent, add the `export` line to your
+`~/.zshrc` or `~/.bashrc`.
+
+You can also pass it directly with `--api-key`, though be aware that on a
+shared machine this leaves the key visible in your shell history and in the
+process list.
+
+**Running under Docker** — copy the template and edit the copy:
+
+```bash
+cp .env.example .env
+nano .env        # replace the placeholder with your real key
+```
+
+`docker-compose.yml` reads `.env` automatically. **`.env` is listed in
+`.gitignore`, so git will not track it** — that's deliberate, and worth
+leaving alone. `.env.example` is the committed template and contains only a
+placeholder.
+
+### Treat the key like a password
+
+It grants read and download access to **every recording in the account** —
+which, for meeting recordings, means other people's voices and words as well
+as your own. So:
+
+- Don't commit it, paste it into an issue, or put it in a screenshot.
+- Don't hardcode it into `fathom_downloader.py`.
+- Revoke and regenerate it in Settings → API Access if it's ever exposed.
+
+If you think you may have committed a key already, rotate it in Fathom
+immediately. Removing it in a later commit does not help — it stays readable
+in the repository history.
 
 ---
 
@@ -60,8 +107,8 @@ like a password. Don't paste it into a file you might commit.
 **Requirements:** Python 3.8+ and the `requests` library.
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/fathom-video-downloader.git
-cd fathom-video-downloader
+git clone https://github.com/mikeangenent/fathom_downloader.git
+cd fathom_downloader
 pip install requests
 ```
 
@@ -132,8 +179,8 @@ your server has.
 ### 1. Get the files onto the server
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/fathom-video-downloader.git
-cd fathom-video-downloader
+git clone https://github.com/mikeangenent/fathom_downloader.git
+cd fathom_downloader
 ```
 
 (No git on the server? Clone locally and `scp -r` the folder over.)
