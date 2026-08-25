@@ -107,7 +107,7 @@ in the repository history.
 **Requirements:** Python 3.8+ and the `requests` library.
 
 ```bash
-git clone https://github.com/mikeangenent/fathom_downloader.git
+git clone https://github.com/donmiguel-stack/fathom_downloader.git
 cd fathom_downloader
 pip install requests
 ```
@@ -179,7 +179,7 @@ your server has.
 ### 1. Get the files onto the server
 
 ```bash
-git clone https://github.com/mikeangenent/fathom_downloader.git
+git clone https://github.com/donmiguel-stack/fathom_downloader.git
 cd fathom_downloader
 ```
 
