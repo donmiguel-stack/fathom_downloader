@@ -142,6 +142,19 @@ python3 fathom_downloader.py --list-only
 | `--since YYYY-MM-DD` | Exact start date, instead of `--years` |
 | `--list-only` | Count what would be downloaded, download nothing |
 | `--api-key KEY` | Pass the key directly instead of via environment |
+| `--max-rate-kbps N` | Throttle to N KB/s (default: unlimited) |
+| `--delay-between-files N` | Pause N seconds after each video |
+| `--max-runtime-hours N` | Stop cleanly after N hours |
+| `--max-idle-sweeps N` | Give up after N fruitless sweeps (default: `3`) |
+
+**On a shared connection, throttle it.** Downloading flat-out will
+saturate a household link for as long as it runs — on satellite or
+anything metered, that's the difference between "a job running in the
+background" and "nobody else can use the internet":
+
+```bash
+python3 fathom_downloader.py --max-rate-kbps 300
+```
 
 Examples:
 
@@ -153,11 +166,28 @@ python3 fathom_downloader.py --since 2024-01-01 --output-dir /Volumes/Archive/fa
 python3 fathom_downloader.py --years 0.5
 ```
 
-### Leaving it running
+### Leaving it running, and running it again
 
 Large libraries take hours. The script is safe to interrupt — `Ctrl+C`, close
 the laptop, lose wifi — and re-running the same command picks up exactly
-where it left off. Anything already downloaded is skipped.
+where it left off. Anything already downloaded is skipped, and a half-
+transferred file resumes from where it stopped rather than starting over.
+
+**Expect to run it more than once.** Fathom renders videos on their side,
+on their schedule, and for a large library many recordings simply won't be
+ready during your first run. Rather than sweeping a list of unrendered
+recordings forever, the script stops after a few fruitless passes and tells
+you what's outstanding:
+
+```
+Stopped: 3 sweeps in a row downloaded nothing
+  Downloaded this run:   66
+  Complete on disk:      66 of 237
+  Still rendering:       171
+```
+
+That's not a failure — it's the expected shape of a big export. Run it again
+in a few hours and those 171 will have made progress.
 
 If you'd rather it survive your terminal closing:
 
@@ -208,7 +238,24 @@ Check you have room first:
 df -h /mnt/data
 ```
 
-### 4. Build and start
+### 4. Check the throttle and the restart policy
+
+Two settings in `docker-compose.yml` are worth understanding before you
+start, because both have bitten this project in production.
+
+**`--max-rate-kbps 300`** throttles the download. Delete it on a fast,
+unshared connection; keep or lower it on satellite, tethered, or metered
+links, where an unthrottled download makes the internet unusable for
+everyone else in the building.
+
+**`restart: on-failure:5`** — do **not** change this to `unless-stopped` or
+`always`. The script exits cleanly once several sweeps in a row find nothing
+new. `unless-stopped` restarts on *any* exit, including that clean one, so
+the whole run relaunches from scratch every few minutes indefinitely. In the
+logs it looks like healthy activity; in reality it never finishes anything.
+`on-failure` restarts only after a genuine crash, which is what you want.
+
+### 5. Build and start
 
 ```bash
 docker compose build
@@ -218,6 +265,10 @@ docker compose logs -f
 
 `Ctrl+C` stops watching the logs. It does **not** stop the download — that
 keeps running in the background.
+
+When the container exits on its own, check the summary — if it reports
+recordings still rendering, run `docker compose up -d` again later to
+collect them.
 
 ### 5. Check on it later
 
@@ -236,8 +287,8 @@ docker compose down                         # stop and remove the container
 servers like Umbrel are often already running memory-hungry services, and on
 a 4 GB Raspberry Pi an unbounded process can trigger the OOM killer and take
 down something you care about a lot more than a video download. The cap costs
-nothing here — the script streams to disk in 1 MB chunks and never holds a
-video in memory. Raise or remove it on a machine with RAM to spare.
+nothing here — the script streams to disk in half-megabyte chunks and never
+holds a video in memory. Raise or remove it on a machine with RAM to spare.
 
 ---
 
@@ -260,15 +311,32 @@ video, waiting for it, then requesting the next serializes work Fathom is
 perfectly happy to do in parallel — the difference between hours and days on
 a large library.
 
-The sweep loop never exits while anything is outstanding. That's also
-deliberate: under `restart: unless-stopped`, a clean exit means an immediate
-restart from scratch, which produces an infinite loop that looks like healthy
-activity in the logs while never finishing anything.
+**Sweeping stops.** After `--max-idle-sweeps` consecutive passes that download
+nothing, the script exits with a summary rather than sweeping on. Fathom's
+rendering resolves over hours, not minutes, so a fourth identical pass over
+171 unrendered recordings costs bandwidth and API quota and returns nothing.
+Exiting and being re-run later is strictly better — hence the restart-policy
+warning above, which is the sharp edge of this design.
+
+**Links are fetched just in time.** A signed URL collected at the start of a
+long run is very likely dead by the time its turn comes. So the status call
+happens immediately before each transfer, and the URL it returns is used at
+once. Conveniently, re-checking status on the same `download_id` returns a
+freshly signed URL each time, so an expired link costs one API call rather
+than a whole new render request.
+
+**Partial files resume.** Downloads stream to a `.part` file that's renamed
+only on success, so an interrupted transfer can never be mistaken for a
+finished video. A later run sends a `Range` header and continues from where
+it stopped — which matters when a 600 MB file dies at 80% on a slow link. If
+the server ignores the range request, the file restarts cleanly rather than
+appending onto existing bytes. Finished transfers are size-checked against
+what Fathom reported; a mismatch keeps the `.part` and retries later.
 
 Rate limiting is built in — roughly 20 requests/minute against the recordings
 endpoints and 50/minute overall, comfortably under Fathom's documented caps.
-The video transfers themselves go to signed storage URLs that don't count
-against the API limit, so those run at full speed.
+The video transfers go to signed storage URLs that don't count against that
+limit, so they run at whatever `--max-rate-kbps` allows.
 
 Progress is tracked in `.fathom_download_state.json` inside your output
 folder. Delete it only if you want to start completely over.
@@ -276,6 +344,28 @@ folder. Delete it only if you want to start completely over.
 ---
 
 ## Troubleshooting
+
+**It exited saying "3 sweeps in a row downloaded nothing."**
+Working as intended. Fathom hasn't finished rendering the rest yet, and
+sweeping on wouldn't change that. Check the "Still rendering: N" line, come
+back in a few hours, and run it again.
+
+**It restarts from the beginning every few minutes, forever.**
+Your restart policy is `unless-stopped` or `always`. Those restart the
+container on *any* exit, including the clean one above, so the run relaunches
+endlessly and never completes. Change it to `on-failure` in
+`docker-compose.yml` and rebuild. This is the single most confusing failure
+mode of the whole project, because the logs look busy and productive.
+
+**The download makes the rest of my internet unusable.**
+Throttle it: `--max-rate-kbps 300` (or lower). Unthrottled, this will take
+every byte your connection can give it for hours at a stretch.
+
+**Lots of `.part` files and read timeouts.**
+Symptoms of a saturated or unreliable link rather than a bug. The `.part`
+files are deliberate — they hold partial progress so a later run resumes
+instead of refetching. Throttling usually reduces the timeouts too, since a
+flattened connection is where most of them come from.
 
 **Nothing downloads; the log just repeats "still rendering."**
 Check what Fathom actually reports for one recording:

@@ -2,7 +2,18 @@ services:
   fathom-downloader:
     build: .
     container_name: fathom-downloader
-    restart: unless-stopped
+
+    # DO NOT change this to `unless-stopped` or `always`.
+    #
+    # The script exits cleanly once several sweeps in a row have found
+    # nothing new to download -- Fathom's rendering takes hours, so
+    # there's no point sweeping on. `unless-stopped` restarts on ANY
+    # exit, including that clean one, which restarts the entire run from
+    # scratch every few minutes, forever. It looks like healthy activity
+    # in the logs and finishes nothing.
+    #
+    # `on-failure` restarts only on a crash, which is what we want.
+    restart: on-failure:5
 
     # Read FATHOM_API_KEY from a .env file next to this one.
     # Copy .env.example to .env and paste your key in.
@@ -27,5 +38,27 @@ services:
     mem_limit: 400m
     memswap_limit: 400m
 
-    # Swap --years for --since YYYY-MM-DD if you want an exact start date.
-    command: ["--output-dir", "/data", "--years", "2"]
+    # Tuned for a slow, shared connection. Adjust to taste:
+    #
+    #   --max-rate-kbps 300     throttle to ~300 KB/s so the download
+    #                           doesn't flatten the household's internet.
+    #                           Delete this line on a fast, unshared link.
+    #   --max-runtime-hours 10  stop cleanly after 10 hours, whatever
+    #                           state things are in.
+    #   --max-idle-sweeps 3     give up after 3 fruitless sweeps.
+    #   --years 2               swap for --since YYYY-MM-DD for an exact
+    #                           start date.
+    #
+    # Re-run `docker compose up -d` whenever you want another pass; it
+    # resumes from the state file and skips everything already fetched.
+    command:
+      - "--output-dir"
+      - "/data"
+      - "--years"
+      - "2"
+      - "--max-rate-kbps"
+      - "300"
+      - "--max-runtime-hours"
+      - "10"
+      - "--max-idle-sweeps"
+      - "3"

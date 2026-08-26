@@ -28,37 +28,57 @@ RUNNING
 By default this downloads every recording from the last 2 years into a
 new "fathom_videos" folder in the current directory. Useful options:
 
-    --output-dir DIR     Where to save videos (default: ./fathom_videos)
-    --years N            How many years back to go (default: 2)
-    --since YYYY-MM-DD    Exact start date instead of --years
-    --list-only          Just show how many meetings/videos would be
-                          downloaded, without downloading anything
-    --api-key KEY         Fathom API key (instead of env var)
+    --output-dir DIR         Where to save videos (default: ./fathom_videos)
+    --years N                How many years back to go (default: 2)
+    --since YYYY-MM-DD       Exact start date instead of --years
+    --list-only              Just show how many meetings/videos would be
+                              downloaded, without downloading anything
+    --api-key KEY            Fathom API key (instead of env var)
+    --max-rate-kbps N        Throttle downloads to N KB/s (0 = unlimited)
+    --delay-between-files N  Pause N seconds between videos
+    --max-runtime-hours N    Stop cleanly after N hours (0 = no limit)
+    --max-idle-sweeps N      Give up after N sweeps with zero downloads
 
 The script keeps a small progress file (.fathom_download_state.json)
 inside the output folder. If it's interrupted (closed laptop, network
 drop, etc.) just run the same command again -- it will skip anything
-already downloaded and resume the rest.
+already downloaded and resume the rest, including picking up part-way
+through a half-transferred file.
 
 HOW IT WORKS
 ------------
 Fathom's video download is a two-step, asynchronous affair: you POST to
 ask for a recording's video, and Fathom hands back a download record
 that becomes "completed" -- carrying a signed, time-limited URL -- once
-the video is ready. Sometimes that's immediate; sometimes it isn't.
+the video is ready. Sometimes that's immediate; sometimes it takes
+hours, and across a large library some recordings stay unrendered far
+longer than you'd like.
 
 So this runs in two phases:
 
   1. Ask Fathom to prepare EVERY outstanding recording, up front. This
      matters: requesting one, waiting for it, then requesting the next
      serializes work that Fathom is perfectly happy to do in parallel.
-  2. Sweep the whole list repeatedly, downloading whatever has become
-     ready since the last pass, backing off between sweeps.
+  2. Sweep the list repeatedly, downloading whatever became ready since
+     the last pass, backing off between sweeps, and stopping once
+     several sweeps in a row have produced nothing.
 
-The sweep loop deliberately never exits while anything is still
-outstanding. Under a process supervisor or Docker restart policy,
-exiting early means an immediate restart from scratch -- an infinite
-loop that looks like progress but never finishes anything.
+That stop condition matters as much as the work does. Fathom's
+rendering does not resolve on a timescale of minutes, so sweeping a
+list of still-rendering recordings indefinitely burns bandwidth and API
+quota to no purpose. This exits cleanly instead, reporting what's still
+outstanding so you know what a later run will pick up.
+
+  !! IF YOU RUN THIS UNDER DOCKER OR A PROCESS SUPERVISOR: make sure a
+  !! clean exit does NOT trigger a restart. Under `restart:
+  !! unless-stopped`, exiting on the idle-sweep ceiling restarts the
+  !! whole run from scratch, forever -- an infinite loop that looks
+  !! like healthy activity in the logs while finishing nothing. Use
+  !! `restart: on-failure` (see the bundled docker-compose.yml).
+
+Signed download URLs are time-limited, so this fetches a fresh one
+immediately before each download rather than trusting one collected at
+the start of a long run.
 
 NOTES ON FATHOM'S API LIMITS
 -----------------------------
@@ -67,8 +87,14 @@ roughly 30 requests per 60 seconds (and this can drop further under
 heavy load). This script paces its own requests to stay comfortably
 under that limit, so a two-year library may take a while to fully
 download -- that's expected and safe to leave running in the
-background. The video transfers themselves go to signed storage URLs
-that don't count against the API limit, so those run at full speed.
+background.
+
+The video transfers themselves go to signed storage URLs that don't
+count against the API limit, so those otherwise run at full speed --
+which on a shared or metered connection (satellite, tethered, or just a
+household where other people are trying to use the internet) can flatten
+the link entirely. Use --max-rate-kbps to leave headroom for everyone
+else.
 """
 
 import argparse
@@ -96,17 +122,25 @@ except ImportError:
 API_BASE = "https://api.fathom.ai/external/v1"
 STATE_FILENAME = ".fathom_download_state.json"
 
-# Streamed download chunk size.
-CHUNK_SIZE = 1024 * 1024  # 1 MB
-# Just used to pace the "still waiting" log message -- the sweep loop
-# itself never gives up and exits while anything's still pending (see the
-# comment above the cooldown logic in main() for why).
-MAX_NO_PROGRESS_SWEEPS = 6
-# Base pause between sweeps; backs off (up to the cap below) the longer a
-# streak of sweeps goes without finding anything new, so we're not
-# hammering the API pointlessly while Fathom is still rendering.
-SWEEP_COOLDOWN_SECONDS = 45
-MAX_SWEEP_COOLDOWN_SECONDS = 5 * 60
+# Streamed download chunk size. Deliberately under a megabyte: with
+# throttling on, large chunks make the rate limiter lumpy (a burst, then
+# a long sleep) rather than a smooth trickle.
+CHUNK_SIZE = 512 * 1024
+
+# Connect and read timeouts, in seconds. The read timeout is the gap
+# between bytes, not the total transfer time, so large files are fine.
+# Keep it short: on a saturated link a dead connection otherwise ties up
+# the socket doing nothing before it finally gives up.
+CONNECT_TIMEOUT = 30
+READ_TIMEOUT = 30
+
+# Pause between sweeps, growing with each fruitless one.
+SWEEP_COOLDOWN_SECONDS = 60
+MAX_SWEEP_COOLDOWN_SECONDS = 15 * 60
+
+
+class IncompleteDownload(Exception):
+    """A transfer finished but isn't the size Fathom said it would be."""
 
 
 class RateLimiter:
@@ -130,11 +164,38 @@ class RateLimiter:
         self.calls.append(time.monotonic())
 
 
+class BandwidthLimiter:
+    """Paces downloads to roughly `max_bytes_per_sec`.
+
+    Downloading flat-out is antisocial on a shared or metered link -- it
+    can make a household's connection unusable for as long as it runs.
+    After each chunk this works out how long the bytes so far *should*
+    have taken and sleeps off the difference.
+    """
+
+    def __init__(self, max_bytes_per_sec):
+        self.max_bytes_per_sec = max_bytes_per_sec
+        self.reset()
+
+    def reset(self):
+        self.started = time.monotonic()
+        self.bytes_seen = 0
+
+    def consume(self, n):
+        if not self.max_bytes_per_sec:
+            return
+        self.bytes_seen += n
+        expected_elapsed = self.bytes_seen / self.max_bytes_per_sec
+        actual_elapsed = time.monotonic() - self.started
+        if expected_elapsed > actual_elapsed:
+            time.sleep(expected_elapsed - actual_elapsed)
+
+
 class FathomClient:
     """Thin wrapper around the Fathom public API with built-in rate
     limiting and retry-on-429/5xx behavior."""
 
-    def __init__(self, api_key):
+    def __init__(self, api_key, bandwidth_limiter=None):
         self.session = requests.Session()
         self.session.headers.update({"X-Api-Key": api_key})
         # General endpoints (e.g. listing meetings without transcript/
@@ -145,6 +206,7 @@ class FathomClient:
         # capped more tightly (~30/60s, sometimes less under load), so
         # we're conservative here.
         self.recordings_limiter = RateLimiter(max_calls=20, period=60)
+        self.bandwidth = bandwidth_limiter or BandwidthLimiter(0)
 
     def _request(self, method, path, limiter, **kwargs):
         url = f"{API_BASE}{path}"
@@ -153,7 +215,9 @@ class FathomClient:
         for attempt in range(1, max_attempts + 1):
             limiter.wait()
             try:
-                resp = self.session.request(method, url, timeout=60, **kwargs)
+                resp = self.session.request(
+                    method, url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), **kwargs
+                )
             except requests.exceptions.RequestException as e:
                 last_exc = e
                 delay = min(60, 2 ** attempt)
@@ -211,29 +275,82 @@ class FathomClient:
         resp.raise_for_status()
         return resp.json()
 
-    def download_file(self, file_url, dest_path):
-        # The signed file_url is pre-authenticated; no rate limiting
-        # needed here, it's not a Fathom API endpoint call.
+    def download_file(self, file_url, dest_path, expected_size=None):
+        """Stream a video to disk, resuming a partial file where possible.
+
+        Writes to a .part file and only renames on success, so an
+        interrupted transfer can never masquerade as a finished video.
+        """
         tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
-        with self.session.get(file_url, stream=True, timeout=120) as resp:
+
+        resume_from = 0
+        if tmp_path.exists():
+            existing = tmp_path.stat().st_size
+            if expected_size and existing == expected_size:
+                # It transferred fully last time; we just never renamed it.
+                tmp_path.rename(dest_path)
+                return
+            if expected_size and existing > expected_size:
+                # Nonsense state -- start over rather than reason about it.
+                tmp_path.unlink()
+            elif existing > 0:
+                resume_from = existing
+
+        headers = {}
+        if resume_from:
+            headers["Range"] = f"bytes={resume_from}-"
+
+        # The signed URL is pre-authenticated, so no API rate limiting
+        # here -- it isn't a Fathom API endpoint. Bandwidth throttling
+        # still applies: that's about the link, not the API.
+        self.bandwidth.reset()
+        with self.session.get(
+            file_url,
+            stream=True,
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            headers=headers,
+        ) as resp:
             resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length") or 0)
-            written = 0
-            next_report = 100 * 1024 * 1024  # log every ~100 MB
-            with open(tmp_path, "wb") as f:
+
+            if resume_from and resp.status_code == 206:
+                mode = "ab"
+                written = resume_from
+                print(f"    resuming from {resume_from / 1e6:.0f} MB")
+            else:
+                if resume_from:
+                    # Server ignored the Range header and is sending the
+                    # whole file, so don't append onto what we have.
+                    print("    (server ignored resume request -- restarting this file)")
+                mode = "wb"
+                written = 0
+
+            total = expected_size or (
+                int(resp.headers.get("Content-Length") or 0)
+                + (resume_from if mode == "ab" else 0)
+            )
+
+            next_report = written + 100 * 1024 * 1024
+            with open(tmp_path, mode) as f:
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     if not chunk:
                         continue
                     f.write(chunk)
                     written += len(chunk)
-                    # Some of these run well over a gigabyte; without this a
-                    # long download is indistinguishable from a hang.
+                    self.bandwidth.consume(len(chunk))
+                    # Some of these run well over a gigabyte; without this
+                    # a long download is indistinguishable from a hang.
                     if written >= next_report:
                         if total:
                             print(f"    ...{written / 1e6:.0f} MB of {total / 1e6:.0f} MB")
                         else:
                             print(f"    ...{written / 1e6:.0f} MB")
                         next_report += 100 * 1024 * 1024
+
+        final_size = tmp_path.stat().st_size
+        if expected_size and final_size != expected_size:
+            # Leave the .part alone: the next attempt resumes from it
+            # rather than re-fetching megabytes already paid for.
+            raise IncompleteDownload(f"got {final_size} bytes, expected {expected_size}")
         tmp_path.rename(dest_path)
 
 
@@ -250,6 +367,19 @@ def extract_file_url(payload):
     if isinstance(video, dict) and video.get("url"):
         return video["url"]
     return payload.get("file_url") or payload.get("url")
+
+
+def extract_file_size(payload):
+    """Fathom reports the video's size alongside its URL. We use it to
+    verify a finished transfer and to resume a partial one."""
+    if not isinstance(payload, dict):
+        return None
+    video = payload.get("video")
+    if isinstance(video, dict):
+        size = video.get("file_size_bytes") or video.get("size")
+        if isinstance(size, int) and size > 0:
+            return size
+    return None
 
 
 def sanitize_filename(name, max_len=120):
@@ -317,8 +447,8 @@ def ensure_download_requested(client, meeting, state, state_path):
         return
     if entry.get("permanent_failure"):
         return  # Fathom flatly refuses this one; no point asking again every sweep
-    if entry.get("download_id") or entry.get("file_url"):
-        return  # already requested (or already have the link) from a prior sweep/run
+    if entry.get("download_id"):
+        return  # already requested from a prior sweep/run
     try:
         result = client.request_download(recording_id)
     except requests.exceptions.RequestException as e:
@@ -339,74 +469,123 @@ def ensure_download_requested(client, meeting, state, state_path):
         return
     entry["download_id"] = result.get("download_id")
     entry["status"] = result.get("status", "pending")
-    # Fathom often hands back the finished video right here in the POST
-    # response, already rendered -- grab it rather than making a pointless
-    # follow-up status call.
-    url = extract_file_url(result)
-    if url:
-        entry["file_url"] = url
+    size = extract_file_size(result)
+    if size:
+        entry["file_size"] = size
     save_state(state_path, state)
 
 
-def check_and_maybe_download(client, meeting, output_dir, state, state_path):
-    """Check this recording's render status once. If it's ready, download
-    it. If not, just report back -- no waiting/polling loop here, the
-    caller re-checks on the next sweep instead."""
+def check_and_maybe_download(client, meeting, output_dir, state, state_path,
+                             delay_between_files=0):
+    """Check this recording's render status once, and download it if it's
+    ready -- using a link fetched in the same breath.
+
+    Fathom's signed URLs are time-limited, so one collected earlier in a
+    long run is quite likely dead by the time its turn comes around.
+    Fetching the status immediately before the transfer costs one API
+    call and removes that whole class of failure.
+    """
     recording_id, entry = _get_entry(state, meeting)
     filename = entry["filename"]
     dest_path = output_dir / filename
 
     if entry.get("status") == "completed" and dest_path.exists():
         return "skipped"
+    if entry.get("permanent_failure"):
+        return "pending"
 
     download_id = entry.get("download_id")
     if not download_id:
-        return "pending"  # not yet requested (will be picked up next sweep)
+        return "pending"  # not yet requested (picked up on the next sweep)
 
-    file_url = entry.get("file_url")
-    if not file_url:
-        try:
-            status = client.get_download_status(recording_id, download_id)
-        except requests.exceptions.RequestException as e:
-            print(f"  Status check failed for {recording_id}: {e}")
-            return "pending"
-        status_value = status.get("status")
-        ready_url = extract_file_url(status)
-        if status_value == "completed" and ready_url:
-            file_url = ready_url
-            entry["file_url"] = file_url
-            save_state(state_path, state)
-        elif status_value in ("expired", "failed", "error", "canceled", "cancelled"):
-            # The download request itself died (e.g. it expired before
-            # Fathom finished rendering it, likely because we fired off a
-            # big batch of requests at once and this one's render didn't
-            # finish inside the window). Clear it so the next line in the
-            # sweep loop asks Fathom for a fresh one -- otherwise we'd poll
-            # a dead request forever and never make progress.
-            print(f"  Download {status_value} for {recording_id} -- requesting a fresh one")
-            entry.pop("download_id", None)
-            entry.pop("file_url", None)
-            entry["status"] = "pending"
-            save_state(state_path, state)
-            return "pending"
-        else:
-            return "pending"  # still rendering, try again next sweep
+    try:
+        status = client.get_download_status(recording_id, download_id)
+    except requests.exceptions.RequestException as e:
+        print(f"  Status check failed for {recording_id}: {e}")
+        return "pending"
+
+    status_value = status.get("status")
+    if status_value in ("expired", "failed", "error", "canceled", "cancelled"):
+        # The download request itself died. Clear it so the next sweep
+        # asks Fathom for a fresh one -- otherwise we'd poll a dead
+        # request forever and never make progress.
+        print(f"  Download {status_value} for {recording_id} -- requesting a fresh one")
+        entry.pop("download_id", None)
+        entry["status"] = "pending"
+        save_state(state_path, state)
+        return "pending"
+
+    file_url = extract_file_url(status)
+    if status_value != "completed" or not file_url:
+        return "pending"  # still rendering; try again next sweep
+
+    expected_size = extract_file_size(status) or entry.get("file_size")
+    if expected_size:
+        entry["file_size"] = expected_size
 
     print(f"  Downloading: {filename}")
     try:
-        client.download_file(file_url, dest_path)
-    except requests.exceptions.RequestException as e:
-        print(f"  Download failed (link may have expired) for {recording_id}: {e}")
-        # Drop the stale file_url/download_id so the next sweep requests fresh ones.
-        entry.pop("file_url", None)
-        entry.pop("download_id", None)
+        client.download_file(file_url, dest_path, expected_size=expected_size)
+    except (requests.exceptions.RequestException, IncompleteDownload, OSError) as e:
+        print(f"  Download failed for {recording_id}: {e}")
+        # Keep download_id: a status check returns a freshly-signed URL
+        # every time, so the link refreshes itself on the next attempt.
+        # Any .part file stays on disk to resume from.
         entry["status"] = "pending"
         save_state(state_path, state)
         return "failed"
 
     entry["status"] = "completed"
+    entry.pop("error", None)
     save_state(state_path, state)
+
+    if delay_between_files:
+        time.sleep(delay_between_files)
     return "downloaded"
+
+
+def tidy_empty_part_files(output_dir):
+    """Remove zero-byte .part stubs left behind by connections that died
+    before sending anything. Partial files with real bytes in them are
+    kept -- those are resumable, and on a slow link expensive to refetch.
+    """
+    removed = 0
+    for part in output_dir.glob("*.part"):
+        try:
+            if part.stat().st_size == 0:
+                part.unlink()
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        print(f"Cleaned up {removed} empty .part file(s) from a previous run.\n")
+
+
+def print_summary(state, meetings, output_dir, downloaded_this_run, reason):
+    def entry_for(m):
+        return state.get(str(m["recording_id"]), {})
+
+    done = sum(1 for m in meetings if entry_for(m).get("status") == "completed")
+    blocked = sum(1 for m in meetings if entry_for(m).get("permanent_failure"))
+    outstanding = len(meetings) - done - blocked
+
+    print("\n" + "=" * 62)
+    print(f"Stopped: {reason}")
+    print("=" * 62)
+    print(f"  Downloaded this run:   {downloaded_this_run}")
+    print(f"  Complete on disk:      {done} of {len(meetings)}")
+    print(f"  Still rendering:       {outstanding}")
+    if blocked:
+        print(f"  Unavailable at Fathom: {blocked} (no video; will not be retried)")
+    print(f"\n  Videos saved to: {output_dir}")
+    if outstanding:
+        print(
+            f"\n  {outstanding} recording(s) are still rendering on Fathom's side.\n"
+            "  That can take many hours. Run this again later and it will pick up\n"
+            "  where it left off -- nothing already downloaded is fetched twice."
+        )
+    else:
+        print("\n  Nothing outstanding. All done.")
 
 
 def main():
@@ -421,6 +600,18 @@ def main():
                          help="Exact start date YYYY-MM-DD, overrides --years")
     parser.add_argument("--list-only", action="store_true",
                          help="Only list how many meetings would be downloaded")
+    parser.add_argument("--max-rate-kbps", type=float, default=0,
+                         help="Throttle downloads to this many KB/s (0 = unlimited). "
+                              "Use on a shared or metered link so the download doesn't "
+                              "flatten the connection for everyone else.")
+    parser.add_argument("--delay-between-files", type=float, default=0,
+                         help="Seconds to pause after each video (default: 0)")
+    parser.add_argument("--max-runtime-hours", type=float, default=0,
+                         help="Stop cleanly after roughly this many hours (0 = no limit)")
+    parser.add_argument("--max-idle-sweeps", type=int, default=3,
+                         help="Give up after this many consecutive sweeps that download "
+                              "nothing (default: 3). Fathom's rendering doesn't resolve "
+                              "in minutes, so sweeping on is wasted effort.")
     args = parser.parse_args()
 
     if not args.api_key:
@@ -441,7 +632,12 @@ def main():
     state_path = output_dir / STATE_FILENAME
     state = load_state(state_path)
 
-    client = FathomClient(args.api_key)
+    bandwidth = BandwidthLimiter(int(args.max_rate_kbps * 1024))
+    client = FathomClient(args.api_key, bandwidth_limiter=bandwidth)
+
+    if args.max_rate_kbps:
+        print(f"Throttling downloads to {args.max_rate_kbps:.0f} KB/s.")
+    tidy_empty_part_files(output_dir)
 
     print(f"Fetching meetings recorded since {since_dt.date().isoformat()}...")
     meetings = fetch_all_meetings(client, since_dt)
@@ -452,14 +648,25 @@ def main():
         print(f"{already} already downloaded, {len(meetings) - already} remaining.")
         return
 
-    def not_completed(m):
-        return state.get(str(m["recording_id"]), {}).get("status") != "completed"
+    def outstanding(m):
+        entry = state.get(str(m["recording_id"]), {})
+        return entry.get("status") != "completed" and not entry.get("permanent_failure")
 
-    # Phase 1: ask Fathom to start rendering EVERY remaining recording up
-    # front, as fast as the rate limit allows. This is what actually lets
-    # Fathom work on many videos in parallel on their end, instead of us
-    # accidentally serializing everything by waiting on one at a time.
-    to_request = [m for m in meetings if not_completed(m)]
+    started = time.monotonic()
+
+    def out_of_time():
+        if not args.max_runtime_hours:
+            return False
+        return (time.monotonic() - started) >= args.max_runtime_hours * 3600
+
+    # Phase 1: ask Fathom to start rendering every remaining recording up
+    # front. This is what lets Fathom work on many videos in parallel on
+    # their end, instead of us serializing everything by waiting on one
+    # at a time.
+    to_request = [
+        m for m in meetings
+        if outstanding(m) and not state.get(str(m["recording_id"]), {}).get("download_id")
+    ]
     if to_request:
         print(f"Requesting video generation for {len(to_request)} meeting(s)...")
         for i, meeting in enumerate(to_request, 1):
@@ -468,63 +675,65 @@ def main():
                 print(f"  Requested {i}/{len(to_request)}...")
 
     # Phase 2: sweep through everyone repeatedly, checking status once per
-    # sweep and downloading whatever's ready. Cheap and fast per sweep
-    # since each check is a single quick API call, not a wait loop.
-    total_counts = {"downloaded": 0, "skipped": 0, "failed": 0, "pending": 0}
+    # sweep and downloading whatever's ready.
+    downloaded_total = 0
     sweep = 0
-    no_progress_sweeps = 0
+    idle_sweeps = 0
+    reason = "nothing left to do"
+
     while True:
-        pending_meetings = [m for m in meetings if not_completed(m)]
+        pending_meetings = [m for m in meetings if outstanding(m)]
         if not pending_meetings:
             break
+        if out_of_time():
+            reason = f"hit the {args.max_runtime_hours:g}h runtime limit"
+            break
+
         sweep += 1
         print(f"\n--- Sweep {sweep}: {len(pending_meetings)} meeting(s) remaining ---\n")
-        sweep_counts = {"downloaded": 0, "skipped": 0, "failed": 0, "pending": 0}
-        for i, meeting in enumerate(pending_meetings, 1):
-            title = meeting.get("title", "(untitled)")
-            # No-op for anything that already has a download_id/file_url or
-            # is completed -- only actually fires a new request for
-            # recordings that were just cleared (e.g. an expired download).
-            ensure_download_requested(client, meeting, state, state_path)
-            result = check_and_maybe_download(client, meeting, output_dir, state, state_path)
-            if result != "pending":
-                print(f"[{i}/{len(pending_meetings)}] {title}: {result}")
-            sweep_counts[result] = sweep_counts.get(result, 0) + 1
-            total_counts[result] = total_counts.get(result, 0) + 1
+        sweep_downloaded = sweep_failed = sweep_pending = 0
+
+        for meeting in pending_meetings:
+            if out_of_time():
+                break
+            result = check_and_maybe_download(
+                client, meeting, output_dir, state, state_path,
+                delay_between_files=args.delay_between_files,
+            )
+            if result == "downloaded":
+                sweep_downloaded += 1
+                downloaded_total += 1
+                print(f"  [{downloaded_total} downloaded so far] {meeting.get('title', '(untitled)')}")
+            elif result == "failed":
+                sweep_failed += 1
+            elif result == "pending":
+                sweep_pending += 1
 
         print(
-            f"\nSweep {sweep} done: {sweep_counts['downloaded']} downloaded, "
-            f"{sweep_counts['pending']} still rendering, {sweep_counts['failed']} failed."
+            f"\nSweep {sweep} done: {sweep_downloaded} downloaded, "
+            f"{sweep_pending} still rendering, {sweep_failed} failed."
         )
-        if sweep_counts["downloaded"] == 0:
-            no_progress_sweeps += 1
-        else:
-            no_progress_sweeps = 0
 
-        if no_progress_sweeps > 0 and no_progress_sweeps % MAX_NO_PROGRESS_SWEEPS == 0:
-            print(
-                f"\nNo new videos finished rendering across the last {no_progress_sweeps} "
-                "sweeps -- still waiting on Fathom to finish rendering the rest. "
-                "This is normal for long recordings; staying up and continuing to check."
-            )
+        idle_sweeps = idle_sweeps + 1 if sweep_downloaded == 0 else 0
 
-        # Back off the more consecutive sweeps come back empty, so we're not
-        # hammering the API once it's clear things are rendering slowly --
-        # but NEVER exit while anything's still pending. Exiting here would
-        # let `restart: unless-stopped` immediately restart the whole run
-        # from scratch, which is exactly the loop we don't want.
+        # Stop once it's clear nothing is becoming available. Fathom's
+        # rendering takes hours, not minutes, so continuing to sweep a
+        # list of still-rendering recordings just burns bandwidth and API
+        # quota. Better to exit with a clear report and be re-run later.
+        # (See the warning at the top of this file: a clean exit must not
+        # trigger an automatic restart, or this becomes an infinite loop.)
+        if idle_sweeps >= args.max_idle_sweeps:
+            reason = f"{idle_sweeps} sweeps in a row downloaded nothing"
+            break
+
         cooldown = min(
-            SWEEP_COOLDOWN_SECONDS * (2 ** min(no_progress_sweeps, 5)),
+            SWEEP_COOLDOWN_SECONDS * (2 ** idle_sweeps),
             MAX_SWEEP_COOLDOWN_SECONDS,
         )
         print(f"Cooling down {cooldown}s before the next sweep...")
         time.sleep(cooldown)
 
-    remaining = sum(1 for m in meetings if not_completed(m))
-    print("\nDone.")
-    print(f"  Downloaded this run:  {total_counts['downloaded']}")
-    print(f"  Still not downloaded: {remaining} (re-run the script to keep retrying)")
-    print(f"\nVideos saved to: {output_dir}")
+    print_summary(state, meetings, output_dir, downloaded_total, reason)
 
 
 if __name__ == "__main__":
