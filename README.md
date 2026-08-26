@@ -29,10 +29,15 @@ both.
 Videos land in your chosen folder, named by date and meeting title:
 
 ```
-2026-08-12 - Meeting XYZ (172549586).mp4
-2026-07-14 - Impromptu Zoom Meeting (163581888).mp4
-2026-04-06 - Weekly Standup (135638912).mp4
+2026-08-12 - Weekly Standup (100000001).mp4
+2026-07-14 - Client Kickoff Call (100000002).mp4
+2026-04-06 - Quarterly Review (100000003).mp4
 ```
+
+(Titles come from whatever the meetings were called in Fathom. If those
+names are sensitive — client sessions, candidate interviews, anything
+confidential — bear that in mind before putting the folder somewhere
+shared or backed up to a service you don't control.)
 
 Sizes vary a lot — a 30-minute call might be 130 MB, a two-hour screen share
 1.3 GB. **A two-year library can easily exceed 100 GB.** Check your free
