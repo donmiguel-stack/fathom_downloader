@@ -29,7 +29,7 @@ both.
 Videos land in your chosen folder, named by date and meeting title:
 
 ```
-2026-08-12 - Mentor Annemarie (172549586).mp4
+2026-08-12 - Meeting XYZ (172549586).mp4
 2026-07-14 - Impromptu Zoom Meeting (163581888).mp4
 2026-04-06 - Weekly Standup (135638912).mp4
 ```
