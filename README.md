@@ -151,6 +151,36 @@ python3 fathom_downloader.py --list-only
 | `--delay-between-files N` | Pause N seconds after each video |
 | `--max-runtime-hours N` | Stop cleanly after N hours |
 | `--max-idle-sweeps N` | Give up after N fruitless sweeps (default: `3`) |
+| `--with-transcripts` | Also save transcripts and summaries |
+| `--transcripts-only` | Save transcripts and summaries, download no video |
+| `--overwrite-text` | Re-write transcript/summary files that already exist |
+
+### Transcripts and summaries
+
+Fathom generates a transcript and an AI summary for each meeting, and this can
+save both beside the video, sharing its name so the three files sort together:
+
+```
+2026-03-04 - Weekly Standup (100000001).mp4
+2026-03-04 - Weekly Standup (100000001).txt
+2026-03-04 - Weekly Standup (100000001).summary.md
+```
+
+```bash
+python3 fathom_downloader.py --with-transcripts
+```
+
+Worth grabbing even if video is what you came for. Text is a few kilobytes per
+meeting against hundreds of megabytes of video, so it costs essentially nothing
+— and it makes the archive searchable, which a folder of `.mp4` files is not.
+`grep -ril "pricing" *.txt` beats scrubbing through 200 recordings.
+
+They arrive in one paginated pass over the meeting list rather than two API
+calls per recording, so the whole library's text takes minutes.
+
+To fetch just the text — no video — use `--transcripts-only`. It keeps no state
+of its own and skips files that already exist, so it's safe to re-run and safe
+to run while a video download is in progress.
 
 **On a shared connection, throttle it.** Downloading flat-out will
 saturate a household link for as long as it runs — on satellite or

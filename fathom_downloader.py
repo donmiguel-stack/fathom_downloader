@@ -248,10 +248,16 @@ class FathomClient:
             raise last_exc
         return resp  # last attempt's response, even if it's an error
 
-    def list_meetings(self, created_after_iso, cursor=None):
+    def list_meetings(self, created_after_iso, cursor=None, include_text=False):
         params = {"created_after": created_after_iso}
         if cursor:
             params["cursor"] = cursor
+        if include_text:
+            # Transcripts and summaries ride along with the meeting list,
+            # so the whole library's text costs one paginated pass rather
+            # than two API calls per recording.
+            params["include_transcript"] = "true"
+            params["include_summary"] = "true"
         resp = self._request("GET", "/meetings", self.general_limiter, params=params)
         resp.raise_for_status()
         return resp.json()
@@ -408,12 +414,12 @@ def save_state(state_path, state):
     tmp.replace(state_path)
 
 
-def fetch_all_meetings(client, since_dt):
+def fetch_all_meetings(client, since_dt, include_text=False):
     since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     meetings = []
     cursor = None
     while True:
-        page = client.list_meetings(since_iso, cursor=cursor)
+        page = client.list_meetings(since_iso, cursor=cursor, include_text=include_text)
         items = page.get("items", [])
         meetings.extend(items)
         cursor = page.get("next_cursor")
@@ -429,6 +435,97 @@ def build_filename(meeting):
     title = sanitize_filename(meeting.get("title") or f"meeting-{meeting.get('recording_id')}")
     recording_id = meeting.get("recording_id")
     return f"{date_part} - {title} ({recording_id}).mp4"
+
+
+def text_paths(output_dir, meeting):
+    """Transcript and summary paths sitting beside the video, sharing its
+    name, so the three files for one meeting sort together."""
+    stem = build_filename(meeting)
+    if stem.endswith(".mp4"):
+        stem = stem[:-4]
+    return output_dir / f"{stem}.txt", output_dir / f"{stem}.summary.md"
+
+
+def format_transcript(meeting):
+    """Render Fathom's transcript array as readable, greppable text."""
+    entries = meeting.get("transcript")
+    if not entries:
+        return None
+
+    title = meeting.get("title") or "(untitled)"
+    started = meeting.get("recording_start_time") or meeting.get("created_at") or ""
+    lines = [title]
+    if started:
+        lines.append(started[:10])
+    lines.append("=" * max(len(title), 12))
+    lines.append("")
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        speaker = (entry.get("speaker") or {}).get("display_name") or "Unknown speaker"
+        text = (entry.get("text") or "").strip()
+        if not text:
+            continue
+        timestamp = entry.get("timestamp")
+        lines.append(f"[{timestamp}] {speaker}: {text}" if timestamp else f"{speaker}: {text}")
+
+    return "\n".join(lines) + "\n"
+
+
+def format_summary(meeting):
+    summary = meeting.get("default_summary")
+    if not isinstance(summary, dict):
+        return None
+    body = summary.get("markdown_formatted")
+    if not body or not body.strip():
+        return None
+
+    title = meeting.get("title") or "(untitled)"
+    started = meeting.get("recording_start_time") or meeting.get("created_at") or ""
+    header = [f"# {title}"]
+    if started:
+        header.append(f"*{started[:10]}*")
+    template = summary.get("template_name")
+    if template:
+        header.append(f"*Summary template: {template}*")
+    return "\n\n".join(header) + "\n\n" + body.rstrip() + "\n"
+
+
+def save_meeting_text(meetings, output_dir, overwrite=False):
+    """Write transcripts and summaries next to their videos.
+
+    Deliberately keeps no state of its own: a file either exists or it
+    doesn't, and that's cheap to check. So this is safe to re-run, and
+    safe to run while a video download is in progress -- it never touches
+    the download state file.
+    """
+    wrote_transcripts = wrote_summaries = 0
+    no_transcript = no_summary = 0
+
+    for meeting in meetings:
+        transcript_path, summary_path = text_paths(output_dir, meeting)
+
+        body = format_transcript(meeting)
+        if body is None:
+            no_transcript += 1
+        elif overwrite or not transcript_path.exists():
+            transcript_path.write_text(body, encoding="utf-8")
+            wrote_transcripts += 1
+
+        body = format_summary(meeting)
+        if body is None:
+            no_summary += 1
+        elif overwrite or not summary_path.exists():
+            summary_path.write_text(body, encoding="utf-8")
+            wrote_summaries += 1
+
+    print(f"  Transcripts written: {wrote_transcripts}")
+    if no_transcript:
+        print(f"  No transcript available: {no_transcript}")
+    print(f"  Summaries written:   {wrote_summaries}")
+    if no_summary:
+        print(f"  No summary available: {no_summary}")
 
 
 def _get_entry(state, meeting):
@@ -565,7 +662,15 @@ def print_summary(state, meetings, output_dir, downloaded_this_run, reason):
     def entry_for(m):
         return state.get(str(m["recording_id"]), {})
 
-    done = sum(1 for m in meetings if entry_for(m).get("status") == "completed")
+    def on_disk(m):
+        # Count files, not state entries. If the two disagree the file is
+        # what matters, and the disagreement is worth surfacing rather
+        # than papering over.
+        filename = entry_for(m).get("filename")
+        return bool(filename) and (output_dir / filename).exists()
+
+    done = sum(1 for m in meetings if on_disk(m))
+    claimed = sum(1 for m in meetings if entry_for(m).get("status") == "completed")
     blocked = sum(1 for m in meetings if entry_for(m).get("permanent_failure"))
     outstanding = len(meetings) - done - blocked
 
@@ -574,6 +679,9 @@ def print_summary(state, meetings, output_dir, downloaded_this_run, reason):
     print("=" * 62)
     print(f"  Downloaded this run:   {downloaded_this_run}")
     print(f"  Complete on disk:      {done} of {len(meetings)}")
+    if claimed > done:
+        print(f"  !! {claimed - done} file(s) marked downloaded are missing from disk "
+              f"-- queued for re-download.")
     print(f"  Still rendering:       {outstanding}")
     if blocked:
         print(f"  Unavailable at Fathom: {blocked} (no video; will not be retried)")
@@ -612,6 +720,16 @@ def main():
                          help="Give up after this many consecutive sweeps that download "
                               "nothing (default: 3). Fathom's rendering doesn't resolve "
                               "in minutes, so sweeping on is wasted effort.")
+    parser.add_argument("--with-transcripts", action="store_true",
+                         help="Also save each meeting's transcript (.txt) and summary "
+                              "(.summary.md) beside its video")
+    parser.add_argument("--transcripts-only", action="store_true",
+                         help="Save transcripts and summaries and then stop, without "
+                              "downloading any video. Fast, tiny, and safe to run while "
+                              "a video download is going.")
+    parser.add_argument("--overwrite-text", action="store_true",
+                         help="Re-write transcripts/summaries that already exist "
+                              "(default: leave them alone)")
     args = parser.parse_args()
 
     if not args.api_key:
@@ -639,8 +757,12 @@ def main():
         print(f"Throttling downloads to {args.max_rate_kbps:.0f} KB/s.")
     tidy_empty_part_files(output_dir)
 
+    want_text = args.with_transcripts or args.transcripts_only
+
     print(f"Fetching meetings recorded since {since_dt.date().isoformat()}...")
-    meetings = fetch_all_meetings(client, since_dt)
+    if want_text:
+        print("  (including transcripts and summaries -- pages are larger, so this is slower)")
+    meetings = fetch_all_meetings(client, since_dt, include_text=want_text)
     print(f"Found {len(meetings)} meetings.\n")
 
     if args.list_only:
@@ -648,9 +770,28 @@ def main():
         print(f"{already} already downloaded, {len(meetings) - already} remaining.")
         return
 
+    if want_text:
+        print("Saving transcripts and summaries...")
+        save_meeting_text(meetings, output_dir, overwrite=args.overwrite_text)
+        print()
+        if args.transcripts_only:
+            print(f"Done. Text files saved to: {output_dir}")
+            return
+
     def outstanding(m):
         entry = state.get(str(m["recording_id"]), {})
-        return entry.get("status") != "completed" and not entry.get("permanent_failure")
+        if entry.get("permanent_failure"):
+            return False
+        if entry.get("status") != "completed":
+            return True
+        # Marked done -- but trust the disk over the state file. A file
+        # can go missing between runs (a cleanup, a half-finished copy,
+        # a drive that wasn't mounted when the state was written), and
+        # if we take "completed" at face value it is never re-fetched
+        # and never even reported as outstanding. The video quietly
+        # isn't there and nothing says so.
+        filename = entry.get("filename")
+        return not (filename and (output_dir / filename).exists())
 
     started = time.monotonic()
 
